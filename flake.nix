@@ -4,16 +4,10 @@
   inputs = {
     # Some utility functions to make the flake less boilerplaty
     flake-utils.url = "github:numtide/flake-utils";
-
-    nixpkgs.url = "nixpkgs/nixos-20.09";
-
-    pretixSrc = {
-      url = "github:pretix/pretix";
-      flake = false;
-    };
+    nixpkgs.url = "nixpkgs/nixos-22.11";
   };
 
-  outputs = { self, nixpkgs, pretixSrc, flake-utils }:
+  outputs = { self, nixpkgs, flake-utils }:
     flake-utils.lib.eachDefaultSystem
       (system:
         let
@@ -24,69 +18,257 @@
         in
         {
           defaultPackage = pkgs.pretix;
-          packages = { inherit (pkgs) pretix update-pretix; };
+          packages = { inherit (pkgs) pretix update-pretix pretixSdist nodeDeps; };
         }) // {
 
-      overlay = final: prev: {
-        update-pretix = prev.writeScriptBin "update-pretix" ''
-          #!/usr/bin/env bash
+      overlay = final: prev: let
+        pretixVersion = "4.16.0";
+        pretixSource = final.fetchFromGitHub {
+          owner = "pretix";
+          repo = "pretix";
+          rev = "v${pretixVersion}";
+          hash = "sha256-xnlW8CbhYPAaO27nyH/ntP8pWYPaGPPyG2A2HGiv6Yo=";
+        };
+        pretixSdist = final.stdenv.mkDerivation {
+          pname = "pretix-sdist";
+          version = pretixVersion;
+          src = pretixSource;
 
-          set -euo pipefail
-          set -x
+          buildInputs = with final; [
+            python3
+            python3Packages.setuptools
+            python3Packages.setuptools-rust
+          ];
 
-          export PATH=${
-            prev.lib.concatMapStringsSep ":" (x: "${x}/bin")
-            (prev.stdenv.initialPath ++ [ final.poetry prev.stdenv.cc ])
-          }:$PATH
+          buildPhase = ''
+            cd src
+            python3 setup.py sdist -k
+          '';
+          installPhase = ''
+            cp -r pretix-${pretixVersion}/ $out
+          '';
+        };
+      in {
+        inherit pretixSdist;
+        update-pretix = final.writeShellApplication {
+          name = "update-pretix";
+          runtimeInputs = with final; ([
+            poetry
+            python3
+            stdenv.cc
+            node2nix
+            gawk
+          ] ++ (with python3Packages; [
+            setuptools
+          ]));
+          text = ''
+            set -euo pipefail
+            set -x
 
-          POETRY=${final.poetry}/bin/poetry
+            workdir=$(mktemp -d)
+            #workdir="/tmp/tmp.Dc5402jTEp"
+            trap 'rm -rf "$workdir"' EXIT
 
-          workdir=$(mktemp -d)
-          trap "rm -rf \"$workdir\"" EXIT
+            pushd "$workdir"
+            cp ${./pyproject.toml.template} pyproject.toml
+            chmod +w pyproject.toml
 
-          pushd "$workdir"
-          cp ${./pyproject.toml.template} pyproject.toml
-          chmod +w pyproject.toml
-          cat ${pretixSrc}/src/requirements/production.txt | \
-            sed -e 's/#.*//' -e 's/\([=<>]\)/@&/' | \
-            xargs "$POETRY" add
+            awk '{
+              if ($0 ~ /\[dev\]/){output="off"; next}
+              if ($0 !~ /\[\w+\]/ && (output == "on" || output == "") && $0 !~ /^$/){ print }
+            }' ${pretixSdist}/pretix.egg-info/requires.txt | xargs poetry add
 
-          poetry add gunicorn
+            poetry add gunicorn
 
-          popd
-          cp "$workdir"/{pyproject.toml,poetry.lock} ./
-        '';
+            mkdir -p node-deps/
+            cd node-deps
+            npmSrc=${pretixSource}/src/pretix/static/npm_dir
+            node2nix -i "''${npmSrc}/package.json" -l "''${npmSrc}/package-lock.json"
+
+            popd
+            cp "$workdir"/{pyproject.toml,poetry.lock} ./
+            mv "$workdir"/node-deps ./node-deps
+          '';
+        };
+        nodeDeps = ((final.callPackage ./node-deps {}).shell.override (old: {
+          src = pretixSource + "/src/pretix/static/npm_dir/";
+        })).nodeDependencies;
+        #update-pretix = prev.writeScriptBin "update-pretix" ''
+        #'';
         pretix = (prev.poetry2nix.mkPoetryApplication {
-          projectDir = pretixSrc;
+          projectDir = pretixSource;
           pyproject = ./pyproject.toml;
           poetrylock = ./poetry.lock;
-          src = pretixSrc + "/src";
-          overrides = prev.poetry2nix.overrides.withDefaults (pself: psuper: {
+          src = pretixSource + "/src";
+          #python =
+          #preferWheels = true;
+
+          overrides = prev.poetry2nix.overrides.withDefaults (pself: psuper: let
+            needsSetuptools = [
+              #"django-phonenumber-field"
+              "django-i18nfield"
+              "pyuca"
+              "defusedcsv"
+              "click"
+              "click-didyoumean"
+              "slimit"
+              "static3"
+              "dj-static"
+              "phonenumberslite"
+              "vat-moss-forked"
+              "django-hierarkey"
+              "python-u2flib-server"
+              "paypalhttp"
+              "paypal-checkout-serversdk"
+              "paypalcheckoutsdk"
+              "django-jquery-js"
+              "django-bootstrap3"
+              "django-markup"
+              "django-mysql"
+              "django-localflavor"
+              "django-formset-js-improved"
+              "django-libsass"
+              "drf-ujson2"
+              "django-scopes"
+            ];
+            withSetuptools = pp: pp.overrideAttrs (a: {
+              buildInputs = (a.buildInputs or [ ])
+                ++ [ pself.setuptools pself.poetry ];
+            });
+
+            allWithSetuptools =  builtins.listToAttrs (map (name: {
+              inherit name;
+              value = withSetuptools psuper.${name};
+            }) needsSetuptools );
+          in ({
+            inherit (final.python3Packages) cryptography typing-extensions pytz six pycparser asgiref sqlparse async-timeout #django-scopes
+            ;
             # The tlds package is an ugly beast which fetches its content
             # at build-time. So instead replace it by a fixed hardcoded
             # version.
-            tlds = psuper.tlds.overrideAttrs (a: {
-              src = prev.fetchFromGitHub {
+            tlds = withSetuptools (psuper.tlds.overrideAttrs (a: {
+              src = final.fetchFromGitHub {
                 owner = "regnat";
                 repo = "tlds";
                 rev = "3c1c0ce416e153a975d7bc753694cfb83242071e";
-                sha256 =
-                  "sha256-u6ZbjgIVozaqgyVonBZBDMrIxIKOM58GDRcqvyaYY+8=";
+                sha256 = "sha256-u6ZbjgIVozaqgyVonBZBDMrIxIKOM58GDRcqvyaYY+8=";
               };
-            });
+            }));
             # For some reason, tqdm is missing a dependency on toml
-            tqdm = psuper.tqdm.overrideAttrs (a: {
+            # django-scopes = final.python3Packages.django-scopes.overrideAttrs (a: {
+            #   # Django-scopes does something fishy to determine its version,
+            #   # which breaks with Nix
+            #   propagatedBuildInputs = #(a.propagatedBuildInputs or [ ]) ++
+            #     [ pself.django ];
+            #   #nativeCheckInputs =
+            #   nativeCheckInputs = #(a.nativeCheckInputs or [ ]) ++
+            #     [ pself.pytest-django pself.pytestCheckHook ];
+            #   prePatch = (a.prePatch or "") + ''
+            #     sed -i "s/version = '?'/version = '${a.version}'/" setup.py
+            #   '';
+            # });
+            css-inline = psuper.css-inline.override {
+              preferWheel = true;
+            };
+            django-hijack = final.python3Packages.django_hijack.overridePythonAttrs (a: {
+              propagatedBuildInputs = with pself; [
+                django
+                django_compat
+              ];
+              checkInputs = [
+                final.python3.pkgs.pytestCheckHook
+                pself.pytest-django
+              ];
+            });
+
+            #django-hijack = .override { preferWheels = true; };
+            pypdf2 = psuper.pypdf2.overrideAttrs (a: {
+              LC_ALL = "en_US.UTF-8";
               buildInputs = (a.buildInputs or [ ])
-              ++ [ prev.python3Packages.toml ];
+                ++ (with final.python3Packages; [
+                  setuptools
+                  flit-core
+                  final.glibcLocales
+                ]);
             });
-            django-scopes = psuper.django-scopes.overrideAttrs (a: {
-              # Django-scopes does something fishy to determine its version,
-              # which breaks with Nix
-              prePatch = (a.prePatch or "") + ''
-                sed -i "s/version = '?'/version = '${a.version}'/" setup.py
-              '';
+
+            reportlab = psuper.reportlab.overrideAttrs (a: let
+              ft = final.freetype.overrideAttrs (oldArgs: { dontDisableStatic = true; });
+            in {
+              LC_ALL = "en_US.UTF-8";
+                postPatch = ''
+                  substituteInPlace setup.py \
+                    --replace "mif = findFile(d,'ft2build.h')" "mif = findFile('${final.lib.getDev ft}','ft2build.h')"
+                  # Remove all the test files that require access to the internet to pass.
+                  rm tests/test_lib_utils.py
+                  rm tests/test_platypus_general.py
+                  rm tests/test_platypus_images.py
+                  # Remove the tests that require Vera fonts installed
+                  rm tests/test_graphics_render.py
+                  rm tests/test_graphics_charts.py
+                '';
+              buildInputs = (a.buildInputs or [ ])
+                ++ (with pself; [
+                  ft
+                  setuptools
+                  setuptools-scm
+                  pillow
+                ]);
             });
-          });
+
+            # Currently only in nixpkgs-unstable...
+            #django-phonenumber-field = prev.python3Packages.django-phonenumber-field;
+            django-phonenumber-field = withSetuptools (psuper.django-phonenumber-field.overrideAttrs (o: rec {
+                pname = "django-phonenumber-field";
+                version = "7.0.2";
+                format = "pyproject";
+                buildInputs = (o.buildInputs or [ ])
+                  ++ [ pself.setuptools-scm ];
+                #buildInputs =
+                #self.setuptools-scm
+
+                src = final.fetchFromGitHub {
+                  owner = "stefanfoulis";
+                  repo = pname;
+                  rev = "refs/tags/${version}";
+                  hash = "sha256-y5eVyF6gBgkH+uQ2424kCe+XRB/ttbnJPkg6ToRxAmI=";
+                };
+
+
+                SETUPTOOLS_SCM_PRETEND_VERSION = version;
+            }));
+
+            django = psuper.django.overrideAttrs (a: {
+              propagatedNativeBuildInputs = (a.propagatedNativeBuildInputs or []) ++ (with final; [
+                gettext
+              ]);
+            });
+
+            pretix = psuper.pretix.overrideAttrs (a: let
+              bi = builtins.filter (d: d.pname == "python3.10-django") (a.buildInputs or []);
+            in {
+              buildInputs = bi ++ [
+                final.nodePackages.npm
+                final.python3Packages.mysqlclient
+                final.gettext
+                pself.django
+              ];
+              ignoreCollisions = true;
+            });
+          } // allWithSetuptools));
+          propagatedNativeBuildInputs = [
+            final.nodePackages.npm
+            final.nodeDeps
+          ];
+          preBuild = ''
+            mkdir -p pretix/static.dist/node_prefix/
+            cp -r ${final.nodeDeps}/lib/node_modules ./pretix/static.dist/node_prefix/
+            #stat /build/src/pretix/static.dist/node_prefix/node_modules/.package-lock.json
+            chmod +w ./pretix/static.dist/node_prefix/node_modules/.package-lock.json
+          '';
+          prePatch = ''
+            sed -i "/subprocess.check_call(\['npm', 'install'/d" setup.py
+          '';
         }).dependencyEnv;
       };
 
@@ -114,6 +296,20 @@
               services.pretix = {
                 enable = true;
                 config = {
+                  pretix = {
+                    instance_name = "Test pretix";
+                  };
+                  locale = {
+                    default = "de";
+                    timezone = "Europe/Berlin";
+                  };
+
+                  languages.enabled = "de,de_informal";
+                  metrics = {
+                    enabled = true;
+                    user = "test";
+                    passphrase = "test";
+                  };
                   database = {
                     backend = "postgresql";
                     name = "pretix";
