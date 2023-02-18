@@ -135,7 +135,7 @@ in
       startAt = "minutely";
     };
 
-    services.redis = {
+    services.redis.servers."" = {
       enable = true;
       unixSocket = "/var/run/redis/redis.sock";
     };
